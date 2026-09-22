@@ -1,5 +1,6 @@
 {
     "compilerOptions": {
+      "rootDir": "./src",
       "outDir": "dist",
       "target": "es6",
       "module": "commonjs",
@@ -9,8 +10,9 @@
       "forceConsistentCasingInFileNames": true,
       "experimentalDecorators": true,
       "emitDecoratorMetadata": true,
+      "sourceMap": true
 
     },
-    "include": ["src/**/*.ts", "./environment.d.ts"],
+    "includyeahe": ["src/**/*.ts", "./environment.d.ts"],
     "exclude": ["node_modules"]
   }

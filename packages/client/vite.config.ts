@@ -1,7 +1,7 @@
 import { defineConfig } from "vite";
 
 // https://vitejs.dev/config/
-export default ({ mode }) => {
+export default ({ mode}: any) => {
 
   const isLocalhost = process.env.NODE_ENV === 'development';
 
