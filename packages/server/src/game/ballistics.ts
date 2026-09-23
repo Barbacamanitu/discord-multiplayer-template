@@ -1,9 +1,10 @@
+import { Terrain, surfaceAt } from "./terrain";
+
 // Shot physics for ScorchMatch. The server is the only place this runs: it simulates each shot once
 // and sends the sampled path to clients to animate, so clients never need their own copy.
 
 export interface StageInfo {
   width: number;
-  groundY: number;
   tankWidth: number;
   tankHeight: number;
   barrelLength: number;
@@ -52,7 +53,7 @@ function insideTank(stage: StageInfo, tank: TankInfo, x: number, y: number) {
 }
 
 // angle is in degrees: 0 points right, 90 straight up, 180 left. power is 0-100.
-export function simulateShot(stage: StageInfo, tanks: TankInfo[], shooter: number, angle: number, power: number): ShotResult {
+export function simulateShot(stage: StageInfo, terrain: Terrain, tanks: TankInfo[], shooter: number, angle: number, power: number): ShotResult {
   const rad = (angle * Math.PI) / 180;
   const speed = power * POWER_TO_VELOCITY;
   let { x, y } = barrelTip(stage, tanks[shooter], angle);
@@ -68,9 +69,10 @@ export function simulateShot(stage: StageInfo, tanks: TankInfo[], shooter: numbe
 
     const t = step * SIM_DT;
     const hitTank = tanks.some((tank, i) => (i !== shooter || t > SELF_HIT_GRACE_SECONDS) && insideTank(stage, tank, x, y));
-    const hitGround = y >= stage.groundY;
+    const ground = x >= 0 && x <= stage.width ? surfaceAt(terrain, x) : Infinity;
+    const hitGround = y >= ground;
     if (hitTank || hitGround) {
-      const impact = { x: Math.round(x), y: Math.round(Math.min(y, stage.groundY)) };
+      const impact = { x: Math.round(x), y: Math.round(Math.min(y, ground)) };
       points.push(impact.x, impact.y);
       return { points, stepMs: SIM_DT * SAMPLE_EVERY * 1000, impact };
     }
@@ -100,23 +102,31 @@ export function explosionDamage(stage: StageInfo, tanks: TankInfo[], impact: { x
   });
 }
 
-// Simple AI: pick a firing angle toward the target, search for the power that lands closest, then add some error
-// so it doesn't hit every time.
-export function chooseAiShot(stage: StageInfo, tanks: TankInfo[], shooter: number, target: number) {
+// Simple AI: try a spread of angles toward the target (so hills in the way don't stop it), find the angle/power
+// that lands closest, then add some error so it doesn't hit every time.
+export function chooseAiShot(stage: StageInfo, terrain: Terrain, tanks: TankInfo[], shooter: number, target: number) {
   const facingRight = tanks[target].x > tanks[shooter].x;
-  const baseAngle = 45 + Math.random() * 20;
-  const angle = Math.round(facingRight ? baseAngle : 180 - baseAngle);
+  const targetX = tanks[target].x;
+  const targetY = tanks[target].y - stage.tankHeight / 2;
 
+  let bestAngle = facingRight ? 45 : 135;
   let bestPower = 50;
   let bestMiss = Infinity;
-  for (let power = 10; power <= 100; power++) {
-    const { impact } = simulateShot(stage, tanks, shooter, angle, power);
-    const miss = impact ? Math.abs(impact.x - tanks[target].x) : Infinity;
-    if (miss < bestMiss) {
-      bestMiss = miss;
-      bestPower = power;
+  for (let elevation = 25; elevation <= 80; elevation += 5) {
+    const angle = facingRight ? elevation : 180 - elevation;
+    for (let power = 10; power <= 100; power += 2) {
+      const { impact } = simulateShot(stage, terrain, tanks, shooter, angle, power);
+      const miss = impact ? Math.hypot(impact.x - targetX, impact.y - targetY) : Infinity;
+      // small random tie-breaker so the AI doesn't always pick the same arc
+      const score = miss + Math.random() * 5;
+      if (score < bestMiss) {
+        bestMiss = score;
+        bestAngle = angle;
+        bestPower = power;
+      }
     }
   }
+  const angle = bestAngle;
 
   const jitter = (range: number) => Math.round((Math.random() * 2 - 1) * range);
   return {

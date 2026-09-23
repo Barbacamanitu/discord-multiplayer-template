@@ -15,14 +15,17 @@ export interface LobbySlot {
 export interface StageView {
   width: number;
   height: number;
-  groundY: number;
+  // terrain can't be dug below this; the strip underneath holds the controls
+  bedrockY: number;
+  // width in px of each terrain column
+  terrainStep: number;
   tankWidth: number;
   tankHeight: number;
   barrelLength: number;
 }
 
 export interface TankView {
-  // center of the tank; y is the bottom of the tank (the ground it sits on)
+  // center of the tank; y is the bottom of the tank (the terrain surface it rests on)
   x: number;
   y: number;
   // degrees: 0 = right, 90 = up, 180 = left
@@ -37,6 +40,10 @@ export interface MatchView {
   stage: StageView;
   // same index as slots
   tanks: TankView[];
+  // surface y of each terrain column (stage.terrainStep px wide)
+  terrain: number[];
+  // changes whenever terrain does, so the scene only redraws it when needed
+  terrainVersion: number;
   turn: number;
   turnPhase: TurnPhase;
   // slot index of the winner once turnPhase === "over", -1 for a draw

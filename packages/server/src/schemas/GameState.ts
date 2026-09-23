@@ -46,7 +46,10 @@ export type Phase = "lobby" | "countdown" | "match";
 export class Stage extends Schema {
   @type("number") width = 1280;
   @type("number") height = 720;
-  @type("number") groundY = 620;
+  // terrain can never be dug below this; the strip underneath holds the on-screen controls
+  @type("number") bedrockY = 640;
+  // width in px of each terrain column
+  @type("number") terrainStep = 4;
   @type("number") tankWidth = 50;
   @type("number") tankHeight = 20;
   @type("number") barrelLength = 30;
@@ -56,7 +59,7 @@ export class Stage extends Schema {
 export class Tank extends Schema {
   // center of the tank
   @type("number") x = 0;
-  // bottom of the tank, i.e. the ground it sits on
+  // bottom of the tank, i.e. the terrain surface it rests on
   @type("number") y = 0;
   // degrees: 0 = right, 90 = up, 180 = left
   @type("number") angle = 45;
@@ -91,6 +94,14 @@ export class GameState extends Schema {
 
   @type([Tank])
   tanks = new ArraySchema<Tank>();
+
+  // terrain heightmap: surface y of each column (stage.terrainStep px wide); only changed columns are sent
+  @type(["uint16"])
+  terrain = new ArraySchema<number>();
+
+  // bumped whenever terrain changes, so clients know to redraw it
+  @type("number")
+  terrainVersion = 0;
 
   // slot index whose turn it is
   @type("number")

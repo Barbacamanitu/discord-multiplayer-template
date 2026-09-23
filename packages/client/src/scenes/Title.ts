@@ -2,10 +2,15 @@ import { Scene } from "phaser";
 import { authorizeDiscordUser } from "../utils/discordSDK";
 import { connectToGame } from "../net/connection";
 import { createButton, createTitle } from "../ui/widgets";
+import { GlobalAudio } from "../sound";
 
 export class Title extends Scene {
   constructor() {
     super("Title");
+  }
+
+  preload() {
+    GlobalAudio.loadFiles(this);
   }
 
   create(data?: { message?: string }) {

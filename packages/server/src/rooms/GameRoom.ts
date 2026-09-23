@@ -1,7 +1,8 @@
 import { Client, Delayed, Room } from "colyseus";
 import { GameState, Draggables, Player, Slot, Tank } from "../schemas/GameState";
 import { DiscordUser, verifyDiscordUser } from "../auth";
-import { chooseAiShot, clamp, explosionDamage, simulateShot } from "../game/ballistics";
+import { EXPLOSION_RADIUS, chooseAiShot, clamp, explosionDamage, simulateShot } from "../game/ballistics";
+import { Terrain, carveCrater, flattenPad, generateHeights, restingY } from "../game/terrain";
 
 // TODO: derive from the selected level
 const SLOT_COUNT = 2;
@@ -15,6 +16,11 @@ const GAME_OVER_MS = 5000;
 const AI_THINK_MS = 1200;
 const AI_AIM_STEP_MS = 30;
 const TANK_MARGIN = 160;
+// random shift of each tank's starting x, so every match plays differently
+const TANK_POSITION_JITTER = 60;
+// generated terrain surface stays between these (y grows downward)
+const TERRAIN_TOP_Y = 280;
+const TERRAIN_BOTTOM_Y = 600;
 
 type ClaimResult = { ok: true } | { ok: false; reason: string };
 
@@ -266,6 +272,7 @@ export class GameRoom extends Room<GameState> {
     this.matchTimer?.clear();
     this.matchTimer = undefined;
     this.state.tanks.clear();
+    this.state.terrain.clear();
     this.state.turnPhase = "aiming";
     this.state.winner = -1;
     this.state.phase = "lobby";
@@ -276,15 +283,44 @@ export class GameRoom extends Room<GameState> {
 
   // --- match ---
 
-  // spread tanks evenly along the ground, each aimed toward the middle
+  // plain-array view of the synced heightmap, for the terrain helpers
+  private terrain(): Terrain {
+    return { heights: this.state.terrain.toArray(), step: this.state.stage.terrainStep, bedrockY: this.state.stage.bedrockY };
+  }
+
+  private writeTerrain(terrain: Terrain, columns?: number[]) {
+    // only touch changed columns so the patch sent to clients stays small
+    const indices = columns ?? terrain.heights.map((_, i) => i);
+    indices.forEach((i) => (this.state.terrain[i] = terrain.heights[i]));
+    this.state.terrainVersion++;
+  }
+
+  // new random hills each match, tanks spread along them (with some jitter) on flattened pads, aimed toward the middle
   private setupTanks() {
     const { stage } = this.state;
     const count = this.state.slots.length;
+    const columns = Math.ceil(stage.width / stage.terrainStep) + 1;
+    const terrain: Terrain = {
+      heights: generateHeights(columns, TERRAIN_TOP_Y, TERRAIN_BOTTOM_Y),
+      step: stage.terrainStep,
+      bedrockY: stage.bedrockY,
+    };
+
+    const positions = Array.from({ length: count }, (_, i) => {
+      const even = count === 1 ? stage.width / 2 : TANK_MARGIN + (i * (stage.width - 2 * TANK_MARGIN)) / (count - 1);
+      return Math.round(even + (Math.random() * 2 - 1) * TANK_POSITION_JITTER);
+    });
+    positions.forEach((x) => flattenPad(terrain, x, stage.tankWidth));
+
+    this.state.terrain.clear();
+    terrain.heights.forEach((h) => this.state.terrain.push(h));
+    this.state.terrainVersion++;
+
     this.state.tanks.clear();
     for (let i = 0; i < count; i++) {
       const tank = new Tank();
-      tank.x = count === 1 ? stage.width / 2 : TANK_MARGIN + (i * (stage.width - 2 * TANK_MARGIN)) / (count - 1);
-      tank.y = stage.groundY;
+      tank.x = positions[i];
+      tank.y = restingY(terrain, tank.x, stage.tankWidth / 2);
       tank.angle = tank.x < stage.width / 2 ? 45 : 135;
       tank.power = 50;
       tank.health = 100;
@@ -321,7 +357,7 @@ export class GameRoom extends Room<GameState> {
     if (!target) {
       return;
     }
-    const shot = chooseAiShot(this.state.stage, tanks, shooter, target.i);
+    const shot = chooseAiShot(this.state.stage, this.terrain(), tanks, shooter, target.i);
 
     // move the barrel toward the chosen shot a step at a time so spectators can see the AI aim
     const tank = this.state.tanks[shooter];
@@ -339,7 +375,7 @@ export class GameRoom extends Room<GameState> {
     const shooter = this.state.turn;
     const tank = this.state.tanks[shooter];
     const tanks = this.state.tanks.toArray();
-    const shot = simulateShot(this.state.stage, tanks, shooter, tank.angle, tank.power);
+    const shot = simulateShot(this.state.stage, this.terrain(), tanks, shooter, tank.angle, tank.power);
 
     this.state.turnPhase = "firing";
     this.broadcast("shot", { shooter, ...shot });
@@ -352,6 +388,14 @@ export class GameRoom extends Room<GameState> {
     if (impact) {
       const damage = explosionDamage(this.state.stage, this.state.tanks.toArray(), impact);
       this.state.tanks.forEach((tank, i) => (tank.health = Math.max(0, tank.health - damage[i])));
+
+      const terrain = this.terrain();
+      const changed = carveCrater(terrain, impact.x, impact.y, EXPLOSION_RADIUS);
+      if (changed.length) {
+        this.writeTerrain(terrain, changed);
+        // tanks whose ground was blown away drop onto whatever is left under them
+        this.state.tanks.forEach((tank) => (tank.y = restingY(terrain, tank.x, this.state.stage.tankWidth / 2)));
+      }
     }
 
     const alive = this.state.tanks.toArray().flatMap((tank, i) => (tank.health > 0 ? [i] : []));

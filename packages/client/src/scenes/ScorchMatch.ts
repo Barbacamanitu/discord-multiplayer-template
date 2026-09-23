@@ -1,5 +1,5 @@
 import { Scene } from "phaser";
-import { LobbyService, LobbyState, ShotEvent, TankView } from "../lobby/LobbyService";
+import { LobbyService, LobbyState, MatchView, ShotEvent, TankView } from "../lobby/LobbyService";
 import { ColyseusLobbyService } from "../lobby/ColyseusLobbyService";
 import { Button, createButton } from "../ui/widgets";
 
@@ -9,6 +9,11 @@ const EXPLOSION_RADIUS = 50;
 const AIM_REPEAT_MS = 40;
 // don't flood the server with aim updates while a key or button is held
 const AIM_SEND_INTERVAL_MS = 60;
+const DIRT_COLOR = 0x7a5a3a;
+const GRASS_COLOR = 0x5b8c3a;
+const BEDROCK_COLOR = 0x3a3a3a;
+// how long a tank takes to drop when the ground under it is blown away
+const TANK_FALL_MS = 400;
 
 interface TankSprite {
   container: Phaser.GameObjects.Container;
@@ -16,6 +21,8 @@ interface TankSprite {
   healthFill: Phaser.GameObjects.Rectangle;
   name: Phaser.GameObjects.Text;
   body: Phaser.GameObjects.Rectangle;
+  // y the tank is at or falling toward, so a fall tween is only started once per change
+  targetY: number;
 }
 
 interface ShotAnimation {
@@ -35,6 +42,8 @@ export class ScorchMatch extends Scene {
   private tankSprites: TankSprite[] = [];
   private projectile!: Phaser.GameObjects.Arc;
   private trail!: Phaser.GameObjects.Graphics;
+  private terrainGfx!: Phaser.GameObjects.Graphics;
+  private drawnTerrainVersion = -1;
   private shotAnim: ShotAnimation | null = null;
 
   private turnText!: Phaser.GameObjects.Text;
@@ -87,7 +96,22 @@ export class ScorchMatch extends Scene {
       strokeThickness: 3,
     }).setOrigin(0.5);
     const container = this.add.container(0,0,[barrel,body,healthBg,healthFill,name]);
-    return { container, barrel, healthFill, name, body };
+    return { container, barrel, healthFill, name, body, targetY: NaN };
+  }
+
+  // dirt polygon from the heightmap down to the bottom of the screen, with a grass line along the surface
+  private drawTerrain(match: MatchView) {
+    const { terrain, stage } = match;
+    this.terrainGfx.clear();
+    if (!terrain.length) {
+      return;
+    }
+    const surface = terrain.map((y, i) => new Phaser.Math.Vector2(i * stage.terrainStep, y));
+    this.terrainGfx.fillStyle(DIRT_COLOR, 1);
+    this.terrainGfx.fillPoints([new Phaser.Math.Vector2(0, stage.height), ...surface, new Phaser.Math.Vector2(stage.width, stage.height)], true);
+    this.terrainGfx.lineStyle(4, GRASS_COLOR, 1);
+    this.terrainGfx.strokePoints(surface, false);
+    this.drawnTerrainVersion = match.terrainVersion;
   }
 
   private tankAim(state: LobbyState, index: number, tank: TankView) {
@@ -122,6 +146,10 @@ export class ScorchMatch extends Scene {
       this.localAim = null;
     }
 
+    if (match.terrainVersion !== this.drawnTerrainVersion) {
+      this.drawTerrain(match);
+    }
+
     while (this.tankSprites.length < match.tanks.length) {
       this.tankSprites.push(this.createTank(this.tankSprites.length, match.stage));
     }
@@ -129,7 +157,15 @@ export class ScorchMatch extends Scene {
       const sprite = this.tankSprites[i];
       const aim = this.tankAim(state, i, tank);
       const alive = tank.health > 0;
-      sprite.container.setPosition(tank.x, tank.y).setAlpha(alive ? 1 : 0.35);
+      sprite.container.setX(tank.x).setAlpha(alive ? 1 : 0.35);
+      if (Number.isNaN(sprite.targetY)) {
+        sprite.container.setY(tank.y);
+      } else if (tank.y !== sprite.targetY) {
+        // ground was blown away under it: drop onto the new surface
+        this.tweens.killTweensOf(sprite.container);
+        this.tweens.add({ targets: sprite.container, y: tank.y, duration: TANK_FALL_MS, ease: "Quad.easeIn" });
+      }
+      sprite.targetY = tank.y;
       sprite.barrel.setRotation(Phaser.Math.DegToRad(-aim.angle));
       sprite.healthFill.width = 50 * (tank.health / 100);
       sprite.healthFill.setFillStyle(tank.health > 50 ? 0x33dd55 : tank.health > 25 ? 0xffcc33 : 0xdd3333);
@@ -276,6 +312,7 @@ export class ScorchMatch extends Scene {
     this.controls = [];
     this.shotAnim = null;
     this.localAim = null;
+    this.drawnTerrainVersion = -1;
     this.aimSendTimer = null;
     this.lastAimSentAt = 0;
     this.keyRepeatAt = 0;
@@ -285,12 +322,12 @@ export class ScorchMatch extends Scene {
     const w = this.cameras.main.width;
     const hW = w/2;
 
-    // sky and flat ground
+    // sky, then terrain (drawn from state in render()), then the bedrock strip that holds the controls
     const sky = this.add.graphics();
     sky.fillGradientStyle(0x1a1a40,0x1a1a40,0x7a4c93,0x7a4c93,1);
-    sky.fillRect(0,0,stage.width,stage.groundY);
-    this.add.rectangle(0,stage.groundY,stage.width,stage.height-stage.groundY,0x5b8c3a).setOrigin(0,0);
-    this.add.rectangle(0,stage.groundY,stage.width,4,0x3d6b25).setOrigin(0,0);
+    sky.fillRect(0,0,stage.width,stage.height);
+    this.terrainGfx = this.add.graphics();
+    this.add.rectangle(0,stage.bedrockY,stage.width,stage.height-stage.bedrockY,BEDROCK_COLOR).setOrigin(0,0);
 
     this.trail = this.add.graphics();
     this.projectile = this.add.circle(0,0,5,0xffffff).setStrokeStyle(1,0x000000).setVisible(false);
@@ -311,7 +348,7 @@ export class ScorchMatch extends Scene {
       strokeThickness: 3,
     }).setOrigin(0.5,0);
 
-    this.bannerText = this.add.text(hW,stage.groundY/2,"",{
+    this.bannerText = this.add.text(hW,200,"",{
       fontFamily: "Arial Black",
       fontSize: 64,
       color: "#fffafa",
@@ -333,8 +370,8 @@ export class ScorchMatch extends Scene {
 
     this.forfeitButton = createButton(this,w-90,40,"Forfeit",() => this.lobby.forfeit(),150,50,{ fontSize: 22 });
 
-    // on-screen controls in the ground strip, for mouse/touch (keyboard works too)
-    const controlsY = stage.groundY + (stage.height - stage.groundY)/2;
+    // on-screen controls in the bedrock strip, for mouse/touch (keyboard works too)
+    const controlsY = stage.bedrockY + (stage.height - stage.bedrockY)/2;
     const small = { fontSize: 22, repeatMs: AIM_REPEAT_MS };
     this.controls = [
       createButton(this,hW-420,controlsY,"Angle ◀",() => this.adjustAim(1,0),140,56,small),
@@ -348,10 +385,10 @@ export class ScorchMatch extends Scene {
     if (keyboard) {
       const K = Phaser.Input.Keyboard.KeyCodes;
       this.keys = {
-        left: keyboard.addKey(K.LEFT),
-        right: keyboard.addKey(K.RIGHT),
-        up: keyboard.addKey(K.UP),
-        down: keyboard.addKey(K.DOWN),
+        left: keyboard.addKey(K.A),
+        right: keyboard.addKey(K.D),
+        up: keyboard.addKey(K.W),
+        down: keyboard.addKey(K.S),
         space: keyboard.addKey(K.SPACE),
       };
       this.keys.space.on("down", () => this.fire());

@@ -59,12 +59,15 @@ export class ColyseusLobbyService implements LobbyService {
       stage: {
         width: stage.width,
         height: stage.height,
-        groundY: stage.groundY,
+        bedrockY: stage.bedrockY,
+        terrainStep: stage.terrainStep,
         tankWidth: stage.tankWidth,
         tankHeight: stage.tankHeight,
         barrelLength: stage.barrelLength,
       },
       tanks: state.tanks.map((t: any) => ({ x: t.x, y: t.y, angle: t.angle, power: t.power, health: t.health })),
+      terrain: state.terrain.toArray(),
+      terrainVersion: state.terrainVersion,
       turn: state.turn,
       turnPhase: state.turnPhase,
       winner: state.winner,
@@ -181,8 +184,10 @@ export class ColyseusLobbyService implements LobbyService {
 
 function emptyMatch(): MatchView {
   return {
-    stage: { width: 1280, height: 720, groundY: 620, tankWidth: 50, tankHeight: 20, barrelLength: 30 },
+    stage: { width: 1280, height: 720, bedrockY: 640, terrainStep: 4, tankWidth: 50, tankHeight: 20, barrelLength: 30 },
     tanks: [],
+    terrain: [],
+    terrainVersion: 0,
     turn: 0,
     turnPhase: "aiming",
     winner: -1,

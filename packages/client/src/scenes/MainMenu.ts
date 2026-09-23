@@ -2,6 +2,7 @@ import { Scene } from "phaser";
 import { LobbyService, LobbySlot, LobbyState } from "../lobby/LobbyService";
 import { ColyseusLobbyService } from "../lobby/ColyseusLobbyService";
 import { Button, createButton, createTitle } from "../ui/widgets";
+import { GlobalAudio } from "../sound";
 
 export class MainMenu extends Scene {
   constructor() {
