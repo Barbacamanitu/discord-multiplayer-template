@@ -4,11 +4,14 @@ import { initiateDiscordSDK } from "./utils/discordSDK";
 import { Boot } from "./scenes/Boot";
 import { Game } from "./scenes/Game";
 import { MainMenu } from "./scenes/MainMenu";
+import { Title } from "./scenes/Title";
+import { ScorchMatch } from "./scenes/ScorchMatch";
 import { Preloader } from "./scenes/Preloader";
 import { Background } from "./scenes/Background";
 
 (async () => {
-  initiateDiscordSDK();
+  // errors resurface when Start calls authorizeDiscordUser(), which shows them on the Title screen
+  initiateDiscordSDK().catch(console.error);
 
   new ScaleFlow({
     type: Phaser.AUTO,
@@ -18,6 +21,6 @@ import { Background } from "./scenes/Background";
     backgroundColor: "#000000",
     roundPixels: false,
     pixelArt: false,
-    scene: [Boot, Preloader, MainMenu, Game, Background],
+    scene: [Boot, Preloader, Title, MainMenu, ScorchMatch, Game, Background],
   });
 })();

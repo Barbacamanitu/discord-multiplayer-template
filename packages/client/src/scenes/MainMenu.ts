@@ -1,5 +1,8 @@
 import { Scene } from "phaser";
-import { authorizeDiscordUser } from "../utils/discordSDK";
+import { LobbyService, LobbySlot, LobbyState } from "../lobby/LobbyService";
+import { ColyseusLobbyService } from "../lobby/ColyseusLobbyService";
+import { Button, createButton, createTitle } from "../ui/widgets";
+
 export class MainMenu extends Scene {
   constructor() {
     super("MainMenu");
@@ -7,47 +10,23 @@ export class MainMenu extends Scene {
 
   private static readonly READY_COLOR = 0x33dd55;
   private static readonly NOT_READY_COLOR = 0xdd3333;
-  private readyIndicators: Partial<Record<1|2, Phaser.GameObjects.Arc>> = {};
-  private readyState: Record<1|2, boolean> = { 1: false, 2: false };
+  private static readonly DISCONNECTED_COLOR = 0x888888;
 
-  private setPlayerReady(player: 1|2, ready: boolean) {
-    this.readyState[player] = ready;
-    this.readyIndicators[player]?.setFillStyle(ready ? MainMenu.READY_COLOR : MainMenu.NOT_READY_COLOR);
+  private lobby!: LobbyService;
+  private slotRows: Phaser.GameObjects.Container[] = [];
+  private pendingClaim: number | null = null;
+  private transitioning = false;
+  private readyButton!: Button;
+  private leaveButton!: Button;
+  private spectatorText!: Phaser.GameObjects.Text;
+  private countdownText!: Phaser.GameObjects.Text;
+  private statusText!: Phaser.GameObjects.Text;
+
+  private localSlot(state: LobbyState): LobbySlot | undefined {
+    return state.slots.find((s) => s.playerId === this.lobby.localPlayerId);
   }
 
-  private createReadyButton(x: number, y: number, onClick: () => void): Phaser.GameObjects.Container {
-    const bg = this.add.rectangle(0,0,220,70,0x2e7d32).setStrokeStyle(4,0x000000).setRounded(10);
-    const text = this.add.text(0,0,"Ready",{
-      fontFamily: "Arial Black",
-      fontSize: 32,
-      color: "#ffffff",
-      stroke: "#000000",
-      strokeThickness: 4,
-    }).setOrigin(0.5);
-    bg.setInteractive({ useHandCursor: true })
-      .on("pointerover", () => bg.setFillStyle(0x43a047))
-      .on("pointerout", () => bg.setFillStyle(0x2e7d32))
-      .on("pointerdown", onClick);
-    return this.add.container(x,y,[bg,text]);
-  }
-
-
-  private createTitle(width: number, height: number,x?: number,y?: number): Phaser.GameObjects.Container {
-    const titleRect = this.add.rectangle(width/2,height/2,width,height,Phaser.Display.Color.ValueToColor("#729785").color,0.9).setRounded(10);
-    const titleText = this.add.text(width/2,height/2,"Rurnt Earth",{
-      fontFamily: "Arial Black",
-      fontSize: 50,
-      color: "#fffafa",
-      stroke: "#00cc00",
-      strokeThickness: 8,
-      align: "center",
-    }).setOrigin(0.5);
-
-    const titleContainer = this.add.container(this.cameras.main.width/2-width/2,this.cameras.main.height/2-height/2-(y ?? 0),[titleRect,titleText]);
-    return titleContainer;
-  }
-
-  private createPlayerReadyup(player: 1|2, username: string,x = 0,y = 0) : Phaser.GameObjects.Container{
+  private createSlotRow(index: number, slot: LobbySlot, canJoin: boolean, x = 0, y = 0) : Phaser.GameObjects.Container{
     const playerLabelStyle =  {
       fontFamily: "Arial Black",
       fontSize: 25,
@@ -64,35 +43,145 @@ export class MainMenu extends Scene {
       strokeThickness: 1,
       align: "left",
     };
-    const label = this.add.text(0,0,`Player ${player}: `,playerLabelStyle,).setOrigin(1,0.5);
-    const nameVal = this.add.text(0,0,username,playerNameStyle).setOrigin(0,0.5);
-    const indicator = this.add.circle(nameVal.width+20,0,10,MainMenu.NOT_READY_COLOR).setStrokeStyle(2,0x000000);
-    this.readyIndicators[player] = indicator;
-    const playerContainer = this.add.container(x,y,[label,nameVal,indicator]);
-    return playerContainer
+    const label = this.add.text(0,0,`Player ${index + 1}: `,playerLabelStyle,).setOrigin(1,0.5);
+
+    if (slot.playerId) {
+      const name = slot.connected ? slot.username ?? "" : `${slot.username} (reconnecting)`;
+      const nameVal = this.add.text(0,0,name,{ ...playerNameStyle, color: slot.connected ? playerNameStyle.color : "#888888" }).setOrigin(0,0.5);
+      const color = !slot.connected ? MainMenu.DISCONNECTED_COLOR : slot.ready ? MainMenu.READY_COLOR : MainMenu.NOT_READY_COLOR;
+      const indicator = this.add.circle(nameVal.width+20,0,10,color).setStrokeStyle(2,0x000000);
+      return this.add.container(x,y,[label,nameVal,indicator]);
+    }
+
+    if (this.pendingClaim === index) {
+      const joining = this.add.text(0,0,"Joining...",{ ...playerNameStyle, color: "#cccccc" }).setOrigin(0,0.5);
+      return this.add.container(x,y,[label,joining]);
+    }
+
+    if (!canJoin) {
+      const open = this.add.text(0,0,"Open",{ ...playerNameStyle, color: "#888888" }).setOrigin(0,0.5);
+      return this.add.container(x,y,[label,open]);
+    }
+
+    const join = this.add.text(0,0,"Join match",{ ...playerNameStyle, color: "#ffffff" }).setOrigin(0,0.5);
+    join.setInteractive({ useHandCursor: true })
+      .on("pointerover", () => join.setColor("#ffe066"))
+      .on("pointerout", () => join.setColor("#ffffff"))
+      .on("pointerdown", () => this.claimSlot(index));
+    return this.add.container(x,y,[label,join]);
+  }
+
+  private goTo(key: string, data?: object) {
+    // state changes can keep arriving before the scene actually shuts down
+    this.transitioning = true;
+    this.scene.start(key, data);
+  }
+
+  private render(state: LobbyState) {
+    if (this.transitioning) {
+      return;
+    }
+    if (state.connection === "disconnected") {
+      this.goTo("Title", { message: "Lost connection to the server" });
+      return;
+    }
+    if (state.phase === "match") {
+      this.goTo("ScorchMatch");
+      return;
+    }
+
+    const hW = this.cameras.main.width/2;
+    const hH = this.cameras.main.height/2;
+    const local = this.localSlot(state);
+    const connected = state.connection === "connected";
+    // one slot per player, and nobody can claim while a claim is in flight
+    const canJoin = connected && !local && this.pendingClaim === null;
+
+    this.slotRows.forEach((row) => row.destroy());
+    this.slotRows = state.slots.map((slot, i) => this.createSlotRow(i, slot, canJoin, hW, hH + 50 + i*50));
+
+    this.spectatorText
+      .setY(hH + 50 + state.slots.length*50)
+      .setText(state.spectators.length ? `Spectating: ${state.spectators.join(", ")}` : "");
+
+    this.countdownText
+      .setText(`Starting in ${state.countdown}`)
+      .setVisible(state.phase === "countdown");
+
+    this.statusText.setText(state.connection === "reconnecting" ? "Reconnecting..." : "");
+
+    this.readyButton.setEnabled(connected && !!local);
+    this.readyButton.setLabel(local?.ready ? "Unready" : "Ready");
+    this.leaveButton.setEnabled(connected && !!local);
+  }
+
+  private async claimSlot(index: number) {
+    if (this.pendingClaim !== null) {
+      return;
+    }
+    this.pendingClaim = index;
+    this.render(this.lobby.getState());
+    const result = await this.lobby.claimSlot(index);
+    // the scene may have shut down while the request was in flight
+    if (!this.sys.isActive()) {
+      return;
+    }
+    this.pendingClaim = null;
+    if (result.ok === false) {
+      console.warn(`Could not claim slot ${index + 1}: ${result.reason}`);
+    }
+    this.render(this.lobby.getState());
   }
 
   create() {
     // scene instances are reused on restart, so reset state here rather than relying on field initializers
-    this.readyState = { 1: false, 2: false };
+    this.slotRows = [];
+    this.pendingClaim = null;
+    this.transitioning = false;
+
     const w = this.cameras.main.width;
     const h = this.cameras.main.height;
     const hW = w/2;
-    const hH = h/2;
 
-    
+    createTitle(this,500,200,200);
 
+    this.spectatorText = this.add.text(hW,0,"",{
+      fontFamily: "Arial",
+      fontSize: 18,
+      color: "#cccccc",
+      align: "center",
+      wordWrap: { width: w - 200 },
+    }).setOrigin(0.5,0);
 
-    
-    const c = this.createTitle(500,200,0,200);
-    const p1= this.createPlayerReadyup(1,"Barbaca",hW,hH+50);
-    const p2= this.createPlayerReadyup(2,"Hella",hW,hH+100);
+    this.countdownText = this.add.text(hW,h-160,"",{
+      fontFamily: "Arial Black",
+      fontSize: 40,
+      color: "#ffe066",
+      stroke: "#000000",
+      strokeThickness: 6,
+    }).setOrigin(0.5).setVisible(false);
 
-    // TODO: toggle the local player once multiplayer is wired up; for now this is always Player 1
-    this.createReadyButton(hW,h-80,() => this.setPlayerReady(1,!this.readyState[1]));
-    //const playerNames = this.add.container(0,0,[p1,p2])
+    this.statusText = this.add.text(hW,20,"",{
+      fontFamily: "Arial",
+      fontSize: 20,
+      color: "#ffcc66",
+    }).setOrigin(0.5,0);
 
+    this.readyButton = createButton(this,hW-125,h-80,"Ready",() => {
+      const slot = this.localSlot(this.lobby.getState());
+      if (slot) {
+        this.lobby.setReady(!slot.ready);
+      }
+    });
+    this.leaveButton = createButton(this,hW+125,h-80,"Leave",() => this.lobby.releaseSlot());
+
+    this.lobby = new ColyseusLobbyService();
+    const unsubscribe = this.lobby.onChange((state) => this.render(state));
+    this.render(this.lobby.getState());
+
+    this.events.once(Phaser.Scenes.Events.SHUTDOWN, () => {
+      unsubscribe();
+      this.lobby.dispose();
+    });
   }
-
-
 }

@@ -1,3 +1,4 @@
+/// <reference types="vite/client" />
 import { CommandResponse, DiscordSDK, DiscordSDKMock } from "@discord/embedded-app-sdk";
 type Auth = CommandResponse<"authenticate">;
 let auth: Auth;
@@ -7,10 +8,19 @@ const isEmbedded = queryParams.get("frame_id") != null;
 
 let discordSdk: DiscordSDK | DiscordSDKMock;
 
-const initiateDiscordSDK = async () => {
+const SDK_READY_TIMEOUT_MS = 10000;
+
+const setupDiscordSDK = async () => {
   if (isEmbedded) {
+    // without a client id the SDK's ready() never resolves, so fail loudly instead of hanging
+    if (!import.meta.env.VITE_CLIENT_ID) {
+      throw new Error("VITE_CLIENT_ID is not set. Vite reads .env from the repo root (envDir in vite.config.ts).");
+    }
     discordSdk = new DiscordSDK(import.meta.env.VITE_CLIENT_ID);
-    await discordSdk.ready();
+    await Promise.race([
+      discordSdk.ready(),
+      new Promise((_, reject) => setTimeout(() => reject(new Error("Timed out waiting for the Discord SDK")), SDK_READY_TIMEOUT_MS)),
+    ]);
   } else {
     // We're using session storage for user_id, guild_id, and channel_id
     // This way the user/guild/channel will be maintained until the tab is closed, even if you refresh
@@ -22,7 +32,7 @@ const initiateDiscordSDK = async () => {
     const mockGuildId = getOverrideOrRandomSessionValue("guild_id");
     const mockChannelId = getOverrideOrRandomSessionValue("channel_id");
 
-    discordSdk = new DiscordSDKMock(import.meta.env.VITE_CLIENT_ID, mockGuildId, mockChannelId);
+    discordSdk = new DiscordSDKMock(import.meta.env.VITE_CLIENT_ID, mockGuildId, mockChannelId,"usa");
     const discriminator = String(mockUserId.charCodeAt(0) % 5);
 
     discordSdk._updateCommandMocks({
@@ -50,9 +60,22 @@ const initiateDiscordSDK = async () => {
   }
 };
 
+// Idempotent, so callers can await it to be sure the SDK is ready before sending commands
+let sdkReady: Promise<void> | undefined;
+const initiateDiscordSDK = () =>
+  (sdkReady ??= setupDiscordSDK().catch((e) => {
+    // allow a retry (e.g. pressing Start again) instead of caching the failure
+    sdkReady = undefined;
+    throw e;
+  }));
+
 // Pop open the OAuth permission modal and request for access to scopes listed in scope array below
 const authorizeDiscordUser = async () => {
+  await initiateDiscordSDK();
+
   if (!isEmbedded) {
+    // Outside Discord, use the mocked authenticate command so each tab gets its own mock user
+    auth = await discordSdk.commands.authenticate({ access_token: "mock_token" });
     return;
   }
 
@@ -74,7 +97,13 @@ const authorizeDiscordUser = async () => {
       code,
     }),
   });
+  if (!response.ok) {
+    throw new Error(`Token exchange failed: /.proxy/api/token returned ${response.status}`);
+  }
   const { access_token } = await response.json();
+  if (!access_token) {
+    throw new Error("Token exchange returned no access_token. Check VITE_CLIENT_ID and CLIENT_SECRET in .env");
+  }
 
   // Authenticate with Discord client (using the access_token)
   auth = await discordSdk.commands.authenticate({
@@ -88,6 +117,18 @@ const getUserName = () => {
   }
 
   return auth.user.username;
+};
+
+// Options the server's onAuth uses to verify who's joining
+const getAuthOptions = () => {
+  if (!auth) {
+    throw new Error("authorizeDiscordUser() must be called before joining a room");
+  }
+  return {
+    accessToken: auth.access_token,
+    userId: auth.user.id,
+    username: auth.user.username,
+  };
 };
 
 enum SessionStorageQueryParam {
@@ -113,4 +154,4 @@ function getOverrideOrRandomSessionValue(queryParam: `${SessionStorageQueryParam
   return randomString;
 }
 
-export { discordSdk, initiateDiscordSDK, authorizeDiscordUser, getUserName };
+export { discordSdk, initiateDiscordSDK, authorizeDiscordUser, getUserName, getAuthOptions };
