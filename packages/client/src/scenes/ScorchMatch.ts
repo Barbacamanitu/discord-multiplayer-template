@@ -1,50 +1,47 @@
 import { Scene } from "phaser";
-import { LobbyService, LobbyState, MatchView, ShotEvent, TankView } from "../lobby/LobbyService";
+import { LobbyService, LobbyState, MatchView, ShotEvent, TankView, TurnPhase } from "../lobby/LobbyService";
 import { ColyseusLobbyService } from "../lobby/ColyseusLobbyService";
 import { Button, createButton } from "../ui/widgets";
+import { AimControl, MatchEvents } from "../match/MatchEvents";
+import { Tank } from "../match/Tank";
+import { Shell } from "../match/Shell";
+import { MatchAudio } from "../audio/MatchAudio";
 
-const TANK_COLORS = [0xff5555, 0x55aaff, 0xffcc33, 0x66dd66, 0xcc77ff, 0xff9955];
-// keep in sync with EXPLOSION_RADIUS in the server's ballistics.ts (visual only)
-const EXPLOSION_RADIUS = 50;
 const AIM_REPEAT_MS = 40;
 // don't flood the server with aim updates while a key or button is held
 const AIM_SEND_INTERVAL_MS = 60;
+// other players' key presses aren't sent over the network, so their angle/power adjusting counts as stopped once updates
+// pause this long. Updates arrive every ~50-60ms while someone holds a control, so this must stay comfortably above that.
+const REMOTE_ADJUST_IDLE_MS = 150;
+// which keyboard keys adjust which part of the aim (the keys object maps these names to A/D/W/S)
+const AIM_KEYS = [
+  { name: "left", control: "angle" },
+  { name: "right", control: "angle" },
+  { name: "up", control: "power" },
+  { name: "down", control: "power" },
+] as const;
 const DIRT_COLOR = 0x7a5a3a;
 const GRASS_COLOR = 0x5b8c3a;
 const BEDROCK_COLOR = 0x3a3a3a;
-// how long a tank takes to drop when the ground under it is blown away
-const TANK_FALL_MS = 400;
-
-interface TankSprite {
-  container: Phaser.GameObjects.Container;
-  barrel: Phaser.GameObjects.Rectangle;
-  healthFill: Phaser.GameObjects.Rectangle;
-  name: Phaser.GameObjects.Text;
-  body: Phaser.GameObjects.Rectangle;
-  // y the tank is at or falling toward, so a fall tween is only started once per change
-  targetY: number;
-}
-
-interface ShotAnimation {
-  shot: ShotEvent;
-  startedAt: number;
-}
 
 // Turn-based artillery match: players take turns setting angle and power, then firing at each other.
-// The server runs the rules and physics; this scene draws the state and sends aim/fire for the local player.
+// The server runs the rules and physics; this scene draws the state, sends aim/fire for the local player,
+// and turns state changes into MatchEvents (which MatchAudio, and anything else, can listen to).
 export class ScorchMatch extends Scene {
   constructor() {
     super("ScorchMatch");
   }
 
   private lobby!: LobbyService;
+  private matchEvents!: MatchEvents;
+  private audio!: MatchAudio;
   private transitioning = false;
-  private tankSprites: TankSprite[] = [];
-  private projectile!: Phaser.GameObjects.Arc;
-  private trail!: Phaser.GameObjects.Graphics;
+  private tanks: Tank[] = [];
+  private shell!: Shell;
   private terrainGfx!: Phaser.GameObjects.Graphics;
   private drawnTerrainVersion = -1;
-  private shotAnim: ShotAnimation | null = null;
+  // previous turn phase, to detect turn starts and the end of the match; null before the first render
+  private lastTurnPhase: TurnPhase | null = null;
 
   private turnText!: Phaser.GameObjects.Text;
   private aimText!: Phaser.GameObjects.Text;
@@ -66,6 +63,11 @@ export class ScorchMatch extends Scene {
     space: Phaser.Input.Keyboard.Key;
   };
   private keyRepeatAt = 0;
+  // aim controls (keys/buttons) the local player is holding right now, per control; aimAdjustStarted/Stopped fire as
+  // each set fills/empties
+  private heldControls: Record<AimControl, Set<string>> = { angle: new Set(), power: new Set() };
+  // other players' tanks that are adjusting, keyed "tank:control", each with the timer that will mark it stopped
+  private remoteAdjustTimers = new Map<string, Phaser.Time.TimerEvent>();
 
   private goTo(key: string, data?: object) {
     this.transitioning = true;
@@ -79,24 +81,6 @@ export class ScorchMatch extends Scene {
   private isMyTurn(state: LobbyState): boolean {
     const me = this.localIndex(state);
     return me >= 0 && state.match.turn === me && state.match.turnPhase === "aiming" && state.connection === "connected";
-  }
-
-  private createTank(index: number, stage: LobbyState["match"]["stage"]): TankSprite {
-    const color = TANK_COLORS[index % TANK_COLORS.length];
-    const body = this.add.rectangle(0,0,stage.tankWidth,stage.tankHeight,color).setOrigin(0.5,1).setStrokeStyle(2,0x000000);
-    // barrel pivots at the top-center of the body; rotation is set from the angle in render()
-    const barrel = this.add.rectangle(0,-stage.tankHeight,stage.barrelLength,6,color).setOrigin(0,0.5).setStrokeStyle(1,0x000000);
-    const healthBg = this.add.rectangle(-25,-stage.tankHeight-45,50,6,0x000000).setOrigin(0,0.5);
-    const healthFill = this.add.rectangle(-25,-stage.tankHeight-45,50,6,0x33dd55).setOrigin(0,0.5);
-    const name = this.add.text(0,-stage.tankHeight-62,"",{
-      fontFamily: "Arial Black",
-      fontSize: 16,
-      color: "#ffffff",
-      stroke: "#000000",
-      strokeThickness: 3,
-    }).setOrigin(0.5);
-    const container = this.add.container(0,0,[barrel,body,healthBg,healthFill,name]);
-    return { container, barrel, healthFill, name, body, targetY: NaN };
   }
 
   // dirt polygon from the heightmap down to the bottom of the screen, with a grass line along the surface
@@ -144,36 +128,62 @@ export class ScorchMatch extends Scene {
       this.localAim = tank ? { angle: tank.angle, power: tank.power } : null;
     } else if (!myTurn) {
       this.localAim = null;
+      // the turn ended mid-press (e.g. fired while holding a key): drop the held controls without an aimAdjustStopped,
+      // since the shot/turn events already cover what happened
+      this.heldControls.angle.clear();
+      this.heldControls.power.clear();
     }
 
     if (match.terrainVersion !== this.drawnTerrainVersion) {
       this.drawTerrain(match);
     }
 
-    while (this.tankSprites.length < match.tanks.length) {
-      this.tankSprites.push(this.createTank(this.tankSprites.length, match.stage));
+    // tanks emit their own events (damaged, fell, destroyed, aimChanged) from sync()
+    while (this.tanks.length < match.tanks.length) {
+      this.tanks.push(new Tank(this, this.tanks.length, match.stage, this.matchEvents));
     }
-    match.tanks.forEach((tank, i) => {
-      const sprite = this.tankSprites[i];
-      const aim = this.tankAim(state, i, tank);
-      const alive = tank.health > 0;
-      sprite.container.setX(tank.x).setAlpha(alive ? 1 : 0.35);
-      if (Number.isNaN(sprite.targetY)) {
-        sprite.container.setY(tank.y);
-      } else if (tank.y !== sprite.targetY) {
-        // ground was blown away under it: drop onto the new surface
-        this.tweens.killTweensOf(sprite.container);
-        this.tweens.add({ targets: sprite.container, y: tank.y, duration: TANK_FALL_MS, ease: "Quad.easeIn" });
-      }
-      sprite.targetY = tank.y;
-      sprite.barrel.setRotation(Phaser.Math.DegToRad(-aim.angle));
-      sprite.healthFill.width = 50 * (tank.health / 100);
-      sprite.healthFill.setFillStyle(tank.health > 50 ? 0x33dd55 : tank.health > 25 ? 0xffcc33 : 0xdd3333);
+    match.tanks.forEach((view, i) => {
       const slot = state.slots[i];
-      sprite.name.setText(`${slot?.username ?? "?"}${slot && !slot.connected ? " (reconnecting)" : ""}`);
-      // highlight whose turn it is
-      sprite.body.setStrokeStyle(i === match.turn && match.turnPhase !== "over" ? 3 : 2, i === match.turn ? 0xffffff : 0x000000);
+      this.tanks[i].sync(view, {
+        ...this.tankAim(state, i, view),
+        name: slot?.username ?? "?",
+        connected: slot?.connected ?? true,
+        activeTurn: i === match.turn && match.turnPhase !== "over",
+        aiming: i === match.turn && match.turnPhase === "aiming",
+      });
     });
+
+    this.emitMatchEvents(state);
+    this.renderHud(state);
+  }
+
+  // match-level events, detected from turn phase changes. Runs after tank sync, so damage from the last shot
+  // is reported before the next turn starts (the server sends both in the same update).
+  private emitMatchEvents(state: LobbyState) {
+    const { match } = state;
+    const me = this.localIndex(state);
+    if (this.lastTurnPhase === null && match.tanks.length) {
+      this.matchEvents.emit("matchStarted", { tankCount: match.tanks.length, localTank: me >= 0 ? me : null });
+    }
+    if (match.turnPhase === "aiming" && this.lastTurnPhase !== "aiming") {
+      this.matchEvents.emit("turnStarted", { tank: match.turn, isLocal: match.turn === me, isAi: !!state.slots[match.turn]?.isAi });
+    }
+    if (match.turnPhase === "loading" && this.lastTurnPhase !== "loading") {
+      // aiming is over for this turn: end any inferred remote adjusting silently (the AI fires the instant it
+      // finishes aiming), matching how the local player's held controls are dropped when their turn ends
+      this.clearRemoteAdjusting();
+      this.matchEvents.emit("shellLoading", { tank: match.turn, isLocal: match.turn === me, x: this.tankX(state, match.turn) });
+    }
+    if (match.turnPhase === "over" && this.lastTurnPhase !== "over") {
+      this.matchEvents.emit("matchOver", { winner: match.winner, localWon: match.winner >= 0 && match.winner === me, isDraw: match.winner < 0 });
+    }
+    this.lastTurnPhase = match.turnPhase;
+  }
+
+  private renderHud(state: LobbyState) {
+    const { match } = state;
+    const me = this.localIndex(state);
+    const myTurn = this.isMyTurn(state);
 
     const current = state.slots[match.turn];
     const currentName = current?.username ?? `Player ${match.turn + 1}`;
@@ -183,7 +193,13 @@ export class ScorchMatch extends Scene {
       this.bannerText.setText(match.winner < 0 ? "Draw!" : match.winner === me ? "You win!" : `${winner?.username ?? "?"} wins!`).setVisible(true);
     } else {
       this.bannerText.setVisible(false);
-      this.turnText.setText(myTurn ? "Your turn!" : match.turnPhase === "firing" ? `${currentName} fired!` : `${currentName}'s turn`);
+      const mine = match.turn === me;
+      const text =
+        myTurn ? "Your turn!"
+        : match.turnPhase === "loading" ? (mine ? "Loading shell..." : `${currentName} is loading...`)
+        : match.turnPhase === "firing" ? (mine ? "Fire!" : `${currentName} fired!`)
+        : `${currentName}'s turn`;
+      this.turnText.setText(text);
     }
 
     const currentTank = match.tanks[match.turn];
@@ -225,6 +241,58 @@ export class ScorchMatch extends Scene {
     this.queueAimSend();
   }
 
+  private tankX(state: LobbyState, tank: number): number {
+    return state.match.tanks[tank]?.x ?? state.match.stage.width / 2;
+  }
+
+  // local aim press/release, from keys and on-screen buttons. Ignored when it isn't our turn.
+  private pressAimControl(control: AimControl, id: string) {
+    const state = this.lobby.getState();
+    const held = this.heldControls[control];
+    if (!this.isMyTurn(state) || held.has(id)) {
+      return;
+    }
+    held.add(id);
+    if (held.size === 1) {
+      const tank = this.localIndex(state);
+      this.matchEvents.emit("aimAdjustStarted", { tank, isLocal: true, control, x: this.tankX(state, tank) });
+    }
+  }
+
+  private releaseAimControl(control: AimControl, id: string) {
+    const held = this.heldControls[control];
+    if (held.delete(id) && held.size === 0) {
+      const state = this.lobby.getState();
+      const tank = this.localIndex(state);
+      this.matchEvents.emit("aimAdjustStopped", { tank, isLocal: true, control, x: this.tankX(state, tank) });
+    }
+  }
+
+  // infer aimAdjustStarted/Stopped for tanks controlled by other players or the AI from their aim updates
+  private trackRemoteAdjust(tank: number, control: AimControl) {
+    const state = this.lobby.getState();
+    if (tank === this.localIndex(state)) {
+      return;
+    }
+    const timerKey = `${tank}:${control}`;
+    const x = this.tankX(state, tank);
+    const timer = this.remoteAdjustTimers.get(timerKey);
+    if (timer) {
+      timer.remove();
+    } else {
+      this.matchEvents.emit("aimAdjustStarted", { tank, isLocal: false, control, x });
+    }
+    this.remoteAdjustTimers.set(timerKey, this.time.delayedCall(REMOTE_ADJUST_IDLE_MS, () => {
+      this.remoteAdjustTimers.delete(timerKey);
+      this.matchEvents.emit("aimAdjustStopped", { tank, isLocal: false, control, x });
+    }));
+  }
+
+  private clearRemoteAdjusting() {
+    this.remoteAdjustTimers.forEach((timer) => timer.remove());
+    this.remoteAdjustTimers.clear();
+  }
+
   // send at most every AIM_SEND_INTERVAL_MS, always ending with the latest value
   private queueAimSend() {
     if (this.aimSendTimer) {
@@ -255,47 +323,27 @@ export class ScorchMatch extends Scene {
     this.lobby.fire();
   }
 
-  private playShot(shot: ShotEvent) {
-    this.shotAnim = { shot, startedAt: this.time.now };
-    this.trail.clear();
-    this.projectile.setPosition(shot.points[0], shot.points[1]).setVisible(true);
-  }
-
-  private explode(x: number, y: number) {
-    const blast = this.add.circle(x,y,EXPLOSION_RADIUS,0xffaa33,0.9).setScale(0.2);
-    this.tweens.add({
-      targets: blast,
-      scale: 1,
-      alpha: 0,
-      duration: 600,
-      ease: "Cubic.easeOut",
-      onComplete: () => blast.destroy(),
-    });
+  private onShot(shot: ShotEvent) {
+    const me = this.localIndex(this.lobby.getState());
+    // normally already cleared when loading started; this covers a shot arriving before that state update
+    this.clearRemoteAdjusting();
+    this.tanks[shot.shooter]?.puffMuzzleSmoke();
+    this.matchEvents.emit("shotFired", { shooter: shot.shooter, isLocal: shot.shooter === me, x: shot.points[0], y: shot.points[1] });
+    this.shell.play(shot);
   }
 
   update(time: number) {
-    if (this.shotAnim) {
-      const { shot, startedAt } = this.shotAnim;
-      const count = shot.points.length / 2;
-      const progress = (time - startedAt) / shot.stepMs;
-      const i = Math.floor(progress);
-      if (i >= count - 1) {
-        this.projectile.setVisible(false);
-        if (shot.impact) {
-          this.explode(shot.impact.x, shot.impact.y);
-        }
-        this.shotAnim = null;
-      } else {
-        // interpolate between samples so the shell moves smoothly at any frame rate
-        const t = progress - i;
-        const x = Phaser.Math.Linear(shot.points[i*2], shot.points[i*2+2], t);
-        const y = Phaser.Math.Linear(shot.points[i*2+1], shot.points[i*2+3], t);
-        this.projectile.setPosition(x, y);
-        this.trail.lineStyle(2, 0xffffff, 0.5).lineBetween(shot.points[i*2], shot.points[i*2+1], x, y);
-      }
-    }
+    this.shell?.update(time);
 
-    // keyboard aiming: arrows adjust (left/right = angle, up/down = power), space fires
+    // keyboard aiming: A/D adjust angle, W/S adjust power, space fires. Presses are picked up here (so a key already
+    // held when our turn starts still counts); releasing comes from each key's "up" event.
+    if (this.keys) {
+      AIM_KEYS.forEach(({ name, control }) => {
+        if (this.keys[name].isDown) {
+          this.pressAimControl(control, `key:${name}`);
+        }
+      });
+    }
     if (this.keys && time >= this.keyRepeatAt) {
       const dAngle = (this.keys.left.isDown ? 1 : 0) - (this.keys.right.isDown ? 1 : 0);
       const dPower = (this.keys.up.isDown ? 1 : 0) - (this.keys.down.isDown ? 1 : 0);
@@ -308,16 +356,20 @@ export class ScorchMatch extends Scene {
 
   create() {
     this.transitioning = false;
-    this.tankSprites = [];
+    this.tanks = [];
     this.controls = [];
-    this.shotAnim = null;
     this.localAim = null;
     this.drawnTerrainVersion = -1;
+    this.lastTurnPhase = null;
     this.aimSendTimer = null;
     this.lastAimSentAt = 0;
     this.keyRepeatAt = 0;
+    this.heldControls = { angle: new Set(), power: new Set() };
+    this.remoteAdjustTimers = new Map();
 
     this.lobby = new ColyseusLobbyService();
+    this.matchEvents = new MatchEvents();
+    this.audio = new MatchAudio(this, this.matchEvents);
     const { stage } = this.lobby.getState().match;
     const w = this.cameras.main.width;
     const hW = w/2;
@@ -329,8 +381,7 @@ export class ScorchMatch extends Scene {
     this.terrainGfx = this.add.graphics();
     this.add.rectangle(0,stage.bedrockY,stage.width,stage.height-stage.bedrockY,BEDROCK_COLOR).setOrigin(0,0);
 
-    this.trail = this.add.graphics();
-    this.projectile = this.add.circle(0,0,5,0xffffff).setStrokeStyle(1,0x000000).setVisible(false);
+    this.shell = new Shell(this, this.matchEvents);
 
     this.turnText = this.add.text(hW,24,"",{
       fontFamily: "Arial Black",
@@ -372,13 +423,21 @@ export class ScorchMatch extends Scene {
 
     // on-screen controls in the bedrock strip, for mouse/touch (keyboard works too)
     const controlsY = stage.bedrockY + (stage.height - stage.bedrockY)/2;
-    const small = { fontSize: 22, repeatMs: AIM_REPEAT_MS };
+    // aim buttons repeat while held and report press/release, so the aim sounds follow them exactly
+    const aimButton = (x: number, label: string, dAngle: number, dPower: number) => {
+      const id = `button:${label}`;
+      const control: AimControl = dAngle !== 0 ? "angle" : "power";
+      return createButton(this,x,controlsY,label,() => {
+        this.pressAimControl(control, id);
+        this.adjustAim(dAngle,dPower);
+      },140,56,{ fontSize: 22, repeatMs: AIM_REPEAT_MS, onRelease: () => this.releaseAimControl(control, id) });
+    };
     this.controls = [
-      createButton(this,hW-420,controlsY,"Angle ◀",() => this.adjustAim(1,0),140,56,small),
-      createButton(this,hW-270,controlsY,"Angle ▶",() => this.adjustAim(-1,0),140,56,small),
+      aimButton(hW-420,"Angle ◀",1,0),
+      aimButton(hW-270,"Angle ▶",-1,0),
       createButton(this,hW,controlsY,"FIRE",() => this.fire(),180,64,{ fontSize: 30 }),
-      createButton(this,hW+270,controlsY,"Power −",() => this.adjustAim(0,-1),140,56,small),
-      createButton(this,hW+420,controlsY,"Power +",() => this.adjustAim(0,1),140,56,small),
+      aimButton(hW+270,"Power −",0,-1),
+      aimButton(hW+420,"Power +",0,1),
     ];
 
     const keyboard = this.input.keyboard;
@@ -392,16 +451,29 @@ export class ScorchMatch extends Scene {
         space: keyboard.addKey(K.SPACE),
       };
       this.keys.space.on("down", () => this.fire());
+      AIM_KEYS.forEach(({ name, control }) => {
+        this.keys[name].on("up", () => this.releaseAimControl(control, `key:${name}`));
+      });
     }
+    this.matchEvents.on("aimChanged", ({ tank, dAngle, dPower }) => {
+      if (dAngle !== 0) {
+        this.trackRemoteAdjust(tank, "angle");
+      }
+      if (dPower !== 0) {
+        this.trackRemoteAdjust(tank, "power");
+      }
+    });
 
     const unsubscribe = this.lobby.onChange((state) => this.render(state));
-    const unsubscribeShot = this.lobby.onShot((shot) => this.playShot(shot));
+    const unsubscribeShot = this.lobby.onShot((shot) => this.onShot(shot));
     this.render(this.lobby.getState());
 
     this.events.once(Phaser.Scenes.Events.SHUTDOWN, () => {
       unsubscribe();
       unsubscribeShot();
       this.lobby.dispose();
+      this.audio.destroy();
+      this.matchEvents.destroy();
       // addKey() returns the same Key objects on the next match, so drop them (and the space listener) here
       this.input.keyboard?.removeAllKeys(true);
     });

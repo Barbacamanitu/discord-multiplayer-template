@@ -68,8 +68,9 @@ export class Tank extends Schema {
   @type("number") health = 100;
 }
 
-// aiming: current player adjusts angle/power. firing: a shell is in the air. over: someone won, back to lobby soon.
-export type TurnPhase = "aiming" | "firing" | "over";
+// aiming: current player adjusts angle/power. loading: fire was pressed, the tank is loading the shell.
+// firing: a shell is in the air. over: someone won, back to lobby soon.
+export type TurnPhase = "aiming" | "loading" | "firing" | "over";
 
 export class GameState extends Schema {
   @type({ map: Draggables })

@@ -1,4 +1,5 @@
 import { Scene } from "phaser";
+import { MatchAudio } from "../audio/MatchAudio";
 
 export class Preloader extends Scene {
   constructor() {
@@ -63,6 +64,8 @@ export class Preloader extends Scene {
     this.load.image("cross_2", "cross.png");
     this.load.image("cross_3", "cross.png");
     this.load.image("grid", "grid.png");
+
+    MatchAudio.preload(this);
   }
 
   create() {

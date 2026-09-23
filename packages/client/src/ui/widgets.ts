@@ -27,6 +27,8 @@ export interface ButtonOptions {
   fontSize?: number;
   // keep calling onClick every repeatMs while the button is held (after an initial delay)
   repeatMs?: number;
+  // called once when a press ends: pointer released over the button, or dragged off it
+  onRelease?: () => void;
 }
 
 export function createButton(scene: Scene, x: number, y: number, label: string, onClick: () => void, width = 220, height = 70, options: ButtonOptions = {}): Button {
@@ -39,18 +41,27 @@ export function createButton(scene: Scene, x: number, y: number, label: string, 
     strokeThickness: 4,
   }).setOrigin(0.5);
   let repeat: Phaser.Time.TimerEvent | undefined;
+  let pressed = false;
   const stopRepeat = () => {
     repeat?.remove();
     repeat = undefined;
+  };
+  const release = () => {
+    stopRepeat();
+    if (pressed) {
+      pressed = false;
+      options.onRelease?.();
+    }
   };
   bg.setInteractive({ useHandCursor: true })
     .on("pointerover", () => bg.setFillStyle(BUTTON_HOVER_COLOR))
     .on("pointerout", () => {
       bg.setFillStyle(BUTTON_COLOR);
-      stopRepeat();
+      release();
     })
-    .on("pointerup", stopRepeat)
+    .on("pointerup", release)
     .on("pointerdown", () => {
+      pressed = true;
       onClick();
       if (options.repeatMs) {
         stopRepeat();
@@ -68,7 +79,9 @@ export function createButton(scene: Scene, x: number, y: number, label: string, 
         bg.setInteractive({ useHandCursor: true });
       } else {
         bg.disableInteractive().setFillStyle(BUTTON_COLOR);
+        // no onRelease here: the owner disabled it, so it already knows the press is over
         stopRepeat();
+        pressed = false;
       }
       bg.setAlpha(enabled ? 1 : 0.4);
       text.setAlpha(enabled ? 1 : 0.4);

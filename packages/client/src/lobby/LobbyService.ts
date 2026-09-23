@@ -34,7 +34,8 @@ export interface TankView {
   health: number;
 }
 
-export type TurnPhase = "aiming" | "firing" | "over";
+// loading: fire was pressed and the tank is loading the shell (~0.5s) before it launches
+export type TurnPhase = "aiming" | "loading" | "firing" | "over";
 
 export interface MatchView {
   stage: StageView;

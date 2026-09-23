@@ -12,6 +12,8 @@ const COUNTDOWN_SECONDS = 3;
 const RECONNECT_SECONDS = 20;
 // how long clients get to show the explosion before damage is applied and the turn passes
 const EXPLOSION_MS = 700;
+// pause between pressing fire and the shell leaving the barrel, as if the tank is loading it
+const SHELL_LOAD_MS = 500;
 const GAME_OVER_MS = 5000;
 const AI_THINK_MS = 1200;
 const AI_AIM_STEP_MS = 30;
@@ -371,7 +373,14 @@ export class GameRoom extends Room<GameState> {
     }, AI_AIM_STEP_MS);
   }
 
+  // fire is pressed (or the AI decides): load for SHELL_LOAD_MS, then launch. Aim and fire are ignored meanwhile,
+  // since both require turnPhase === "aiming".
   private fire() {
+    this.state.turnPhase = "loading";
+    this.matchTimer = this.clock.setTimeout(() => this.launchShell(), SHELL_LOAD_MS);
+  }
+
+  private launchShell() {
     const shooter = this.state.turn;
     const tank = this.state.tanks[shooter];
     const tanks = this.state.tanks.toArray();
