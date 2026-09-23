@@ -1,6 +1,7 @@
 import { Client, Delayed, Room } from "colyseus";
-import { GameState, Draggables, Player, Slot } from "../schemas/GameState";
+import { GameState, Draggables, Player, Slot, Tank } from "../schemas/GameState";
 import { DiscordUser, verifyDiscordUser } from "../auth";
+import { chooseAiShot, clamp, explosionDamage, simulateShot } from "../game/ballistics";
 
 // TODO: derive from the selected level
 const SLOT_COUNT = 2;
@@ -8,6 +9,12 @@ const READY_CHECK_INTERVAL_MS = 500;
 const COUNTDOWN_SECONDS = 3;
 // how long a dropped connection keeps its slot before it's released
 const RECONNECT_SECONDS = 20;
+// how long clients get to show the explosion before damage is applied and the turn passes
+const EXPLOSION_MS = 700;
+const GAME_OVER_MS = 5000;
+const AI_THINK_MS = 1200;
+const AI_AIM_STEP_MS = 30;
+const TANK_MARGIN = 160;
 
 type ClaimResult = { ok: true } | { ok: false; reason: string };
 
@@ -16,6 +23,8 @@ export class GameRoom extends Room<GameState> {
   maxClients = 25; // Current Discord limit is 25
 
   private countdownTimer?: Delayed;
+  // the one pending match event: an AI move, a shell landing, or returning to the lobby
+  private matchTimer?: Delayed;
 
   onCreate(options: any): void | Promise<any> {
     const draggableList = [
@@ -80,10 +89,44 @@ export class GameRoom extends Room<GameState> {
       }
     });
 
-    // placeholder until the match has a real win/lose condition
+    // anyone connected (players or spectators) can fill an open slot with an AI, including AI vs AI
+    this.onMessage("addAi", (client, message: { index: number }) => {
+      const slot = this.slotAt(message?.index);
+      if (slot && this.state.phase === "lobby" && !slot.sessionId && !slot.isAi) {
+        slot.isAi = true;
+        slot.ready = true;
+      }
+    });
+
+    this.onMessage("removeAi", (client, message: { index: number }) => {
+      const slot = this.slotAt(message?.index);
+      if (slot?.isAi && this.state.phase !== "match") {
+        slot.isAi = false;
+        slot.ready = false;
+      }
+    });
+
+    // placeholder until the match has a real win/lose condition. With no humans in the match (AI vs AI),
+    // anyone can end it, otherwise nobody could.
     this.onMessage("forfeit", (client) => {
-      if (this.state.phase === "match" && this.slotOf(client.sessionId)) {
+      const hasHumanPlayers = this.state.slots.some((s) => s.sessionId);
+      if (this.state.phase === "match" && (this.slotOf(client.sessionId) || !hasHumanPlayers)) {
         this.endMatch();
+      }
+    });
+
+    // the current player adjusting their shot; synced so everyone sees the barrel move
+    this.onMessage("aim", (client, message: { angle: number; power: number }) => {
+      const tank = this.currentHumanTank(client.sessionId);
+      if (tank && Number.isFinite(message?.angle) && Number.isFinite(message?.power)) {
+        tank.angle = clamp(Math.round(message.angle), 0, 180);
+        tank.power = clamp(Math.round(message.power), 0, 100);
+      }
+    });
+
+    this.onMessage("fire", (client) => {
+      if (this.currentHumanTank(client.sessionId)) {
+        this.fire();
       }
     });
 
@@ -135,15 +178,19 @@ export class GameRoom extends Room<GameState> {
     return this.state.slots.find((s) => s.sessionId === sessionId);
   }
 
+  private slotAt(index: unknown): Slot | undefined {
+    return Number.isInteger(index) ? this.state.slots[index as number] : undefined;
+  }
+
   private claimSlot(sessionId: string, index: unknown): ClaimResult {
     if (this.state.phase === "match") {
       return { ok: false, reason: "Match already in progress" };
     }
-    const slot = Number.isInteger(index) ? this.state.slots[index as number] : undefined;
+    const slot = this.slotAt(index);
     if (!slot) {
       return { ok: false, reason: "No such slot" };
     }
-    if (slot.sessionId) {
+    if (slot.sessionId || slot.isAi) {
       return { ok: false, reason: "Slot already taken" };
     }
     if (this.slotOf(sessionId)) {
@@ -170,7 +217,7 @@ export class GameRoom extends Room<GameState> {
   private allSlotsReady(): boolean {
     return (
       this.state.slots.length > 0 &&
-      this.state.slots.every((s) => s.sessionId && s.ready && this.state.players.get(s.sessionId)?.connected)
+      this.state.slots.every((s) => s.isAi || (s.sessionId && s.ready && this.state.players.get(s.sessionId)?.connected))
     );
   }
 
@@ -208,14 +255,119 @@ export class GameRoom extends Room<GameState> {
   private startMatch() {
     this.countdownTimer?.clear();
     this.countdownTimer = undefined;
+    this.setupTanks();
     this.state.phase = "match";
     this.state.countdown = 0;
-    console.log(`Match started: ${this.state.slots.map((s) => this.state.players.get(s.sessionId)?.username).join(" vs ")}`);
+    this.beginTurn(0);
+    console.log(`Match started: ${this.state.slots.map((s) => (s.isAi ? "AI" : this.state.players.get(s.sessionId)?.username)).join(" vs ")}`);
   }
 
   private endMatch() {
+    this.matchTimer?.clear();
+    this.matchTimer = undefined;
+    this.state.tanks.clear();
+    this.state.turnPhase = "aiming";
+    this.state.winner = -1;
     this.state.phase = "lobby";
-    this.state.slots.forEach((s) => (s.ready = false));
+    // AI slots stay ready
+    this.state.slots.forEach((s) => (s.ready = s.isAi));
     console.log("Match ended, back to lobby");
+  }
+
+  // --- match ---
+
+  // spread tanks evenly along the ground, each aimed toward the middle
+  private setupTanks() {
+    const { stage } = this.state;
+    const count = this.state.slots.length;
+    this.state.tanks.clear();
+    for (let i = 0; i < count; i++) {
+      const tank = new Tank();
+      tank.x = count === 1 ? stage.width / 2 : TANK_MARGIN + (i * (stage.width - 2 * TANK_MARGIN)) / (count - 1);
+      tank.y = stage.groundY;
+      tank.angle = tank.x < stage.width / 2 ? 45 : 135;
+      tank.power = 50;
+      tank.health = 100;
+      this.state.tanks.push(tank);
+    }
+    this.state.winner = -1;
+  }
+
+  // the caller's tank if it's their turn and they're allowed to act, otherwise undefined
+  private currentHumanTank(sessionId: string): Tank | undefined {
+    const slot = this.state.slots[this.state.turn];
+    if (this.state.phase !== "match" || this.state.turnPhase !== "aiming" || !slot || slot.sessionId !== sessionId) {
+      return undefined;
+    }
+    return this.state.tanks[this.state.turn];
+  }
+
+  private beginTurn(index: number) {
+    this.state.turn = index;
+    this.state.turnPhase = "aiming";
+    if (this.state.slots[index]?.isAi) {
+      this.matchTimer = this.clock.setTimeout(() => this.playAiTurn(), AI_THINK_MS);
+    }
+  }
+
+  private playAiTurn() {
+    const shooter = this.state.turn;
+    const tanks = this.state.tanks.toArray();
+    // aim at the nearest living opponent
+    const target = tanks
+      .map((tank, i) => ({ tank, i }))
+      .filter(({ tank, i }) => i !== shooter && tank.health > 0)
+      .sort((a, b) => Math.abs(a.tank.x - tanks[shooter].x) - Math.abs(b.tank.x - tanks[shooter].x))[0];
+    if (!target) {
+      return;
+    }
+    const shot = chooseAiShot(this.state.stage, tanks, shooter, target.i);
+
+    // move the barrel toward the chosen shot a step at a time so spectators can see the AI aim
+    const tank = this.state.tanks[shooter];
+    this.matchTimer = this.clock.setInterval(() => {
+      tank.angle += Math.sign(shot.angle - tank.angle);
+      tank.power += Math.sign(shot.power - tank.power);
+      if (tank.angle === shot.angle && tank.power === shot.power) {
+        this.matchTimer?.clear();
+        this.fire();
+      }
+    }, AI_AIM_STEP_MS);
+  }
+
+  private fire() {
+    const shooter = this.state.turn;
+    const tank = this.state.tanks[shooter];
+    const tanks = this.state.tanks.toArray();
+    const shot = simulateShot(this.state.stage, tanks, shooter, tank.angle, tank.power);
+
+    this.state.turnPhase = "firing";
+    this.broadcast("shot", { shooter, ...shot });
+
+    const flightMs = (shot.points.length / 2) * shot.stepMs;
+    this.matchTimer = this.clock.setTimeout(() => this.resolveShot(shot.impact), flightMs + EXPLOSION_MS);
+  }
+
+  private resolveShot(impact: { x: number; y: number } | null) {
+    if (impact) {
+      const damage = explosionDamage(this.state.stage, this.state.tanks.toArray(), impact);
+      this.state.tanks.forEach((tank, i) => (tank.health = Math.max(0, tank.health - damage[i])));
+    }
+
+    const alive = this.state.tanks.toArray().flatMap((tank, i) => (tank.health > 0 ? [i] : []));
+    if (alive.length <= 1) {
+      this.state.winner = alive.length === 1 ? alive[0] : -1;
+      this.state.turnPhase = "over";
+      this.matchTimer = this.clock.setTimeout(() => this.endMatch(), GAME_OVER_MS);
+      return;
+    }
+
+    // next living tank after the current one
+    const count = this.state.tanks.length;
+    let next = this.state.turn;
+    do {
+      next = (next + 1) % count;
+    } while (this.state.tanks[next].health <= 0);
+    this.beginTurn(next);
   }
 }

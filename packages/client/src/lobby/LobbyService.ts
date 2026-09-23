@@ -8,6 +8,48 @@ export interface LobbySlot {
   ready: boolean;
   // false while the server is holding the slot for a dropped player
   connected: boolean;
+  // AI slots have no playerId and are always ready
+  isAi: boolean;
+}
+
+export interface StageView {
+  width: number;
+  height: number;
+  groundY: number;
+  tankWidth: number;
+  tankHeight: number;
+  barrelLength: number;
+}
+
+export interface TankView {
+  // center of the tank; y is the bottom of the tank (the ground it sits on)
+  x: number;
+  y: number;
+  // degrees: 0 = right, 90 = up, 180 = left
+  angle: number;
+  power: number;
+  health: number;
+}
+
+export type TurnPhase = "aiming" | "firing" | "over";
+
+export interface MatchView {
+  stage: StageView;
+  // same index as slots
+  tanks: TankView[];
+  turn: number;
+  turnPhase: TurnPhase;
+  // slot index of the winner once turnPhase === "over", -1 for a draw
+  winner: number;
+}
+
+// sent by the server when a shell is fired; the path is precomputed so clients only animate it
+export interface ShotEvent {
+  shooter: number;
+  // flattened [x0, y0, x1, y1, ...], one position every stepMs
+  points: number[];
+  stepMs: number;
+  impact: { x: number; y: number } | null;
 }
 
 export interface LobbyState {
@@ -19,6 +61,7 @@ export interface LobbyState {
   slots: LobbySlot[];
   // usernames of everyone connected who isn't holding a slot
   spectators: string[];
+  match: MatchView;
 }
 
 export type ClaimResult = { ok: true } | { ok: false; reason: string };
@@ -32,7 +75,13 @@ export interface LobbyService {
   // give up your slot and go back to spectating
   releaseSlot(): void;
   setReady(ready: boolean): void;
-  // placeholder until matches have a real win/lose condition
+  addAi(index: number): void;
+  removeAi(index: number): void;
+  // placeholder until matches have a real win/lose condition; in an AI-only match anyone can use it to end the match
   forfeit(): void;
+  // match controls; the server ignores them unless it's your turn
+  aim(angle: number, power: number): void;
+  fire(): void;
+  onShot(listener: (shot: ShotEvent) => void): () => void;
   dispose(): void;
 }

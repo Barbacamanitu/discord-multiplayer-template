@@ -23,19 +23,42 @@ export interface Button {
   setEnabled(enabled: boolean): void;
 }
 
-export function createButton(scene: Scene, x: number, y: number, label: string, onClick: () => void, width = 220, height = 70): Button {
+export interface ButtonOptions {
+  fontSize?: number;
+  // keep calling onClick every repeatMs while the button is held (after an initial delay)
+  repeatMs?: number;
+}
+
+export function createButton(scene: Scene, x: number, y: number, label: string, onClick: () => void, width = 220, height = 70, options: ButtonOptions = {}): Button {
   const bg = scene.add.rectangle(0,0,width,height,BUTTON_COLOR).setStrokeStyle(4,0x000000).setRounded(10);
   const text = scene.add.text(0,0,label,{
     fontFamily: "Arial Black",
-    fontSize: 32,
+    fontSize: options.fontSize ?? 32,
     color: "#ffffff",
     stroke: "#000000",
     strokeThickness: 4,
   }).setOrigin(0.5);
+  let repeat: Phaser.Time.TimerEvent | undefined;
+  const stopRepeat = () => {
+    repeat?.remove();
+    repeat = undefined;
+  };
   bg.setInteractive({ useHandCursor: true })
     .on("pointerover", () => bg.setFillStyle(BUTTON_HOVER_COLOR))
-    .on("pointerout", () => bg.setFillStyle(BUTTON_COLOR))
-    .on("pointerdown", onClick);
+    .on("pointerout", () => {
+      bg.setFillStyle(BUTTON_COLOR);
+      stopRepeat();
+    })
+    .on("pointerup", stopRepeat)
+    .on("pointerdown", () => {
+      onClick();
+      if (options.repeatMs) {
+        stopRepeat();
+        repeat = scene.time.delayedCall(300, () => {
+          repeat = scene.time.addEvent({ delay: options.repeatMs, loop: true, callback: onClick });
+        });
+      }
+    });
 
   return {
     container: scene.add.container(x,y,[bg,text]),
@@ -45,6 +68,7 @@ export function createButton(scene: Scene, x: number, y: number, label: string, 
         bg.setInteractive({ useHandCursor: true });
       } else {
         bg.disableInteractive().setFillStyle(BUTTON_COLOR);
+        stopRepeat();
       }
       bg.setAlpha(enabled ? 1 : 0.4);
       text.setAlpha(enabled ? 1 : 0.4);
